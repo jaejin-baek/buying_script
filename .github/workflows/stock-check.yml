@@ -17,7 +17,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -28,8 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install deps
-        run: pip install --no-cache-dir requests==2.32.3
+      - name: Install Playwright + Chromium
+        run: |
+          pip install --no-cache-dir playwright==1.47.0
+          playwright install --with-deps chromium
 
       - name: Run stock check
         env:

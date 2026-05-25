@@ -1,25 +1,23 @@
 """
 Cartier d'Amour bracelet (small, CRB6043300) 재고 감시기.
 
-상품 페이지 HTML을 받아서
+Playwright(헤드리스 Chromium) 로 페이지를 열어서 HTML을 받는다.
+까르띠에 사이트가 GitHub Actions IP 대역의 requests 요청은 403으로 막기 때문에,
+실제 브라우저로 위장해야 통과한다.
+
+판정 로직:
 - '상담원 연결' 같은 '재고 없음' 마커가 보이면 → 재고 없음
 - '장바구니에 담기' / '사이즈 선택' 같은 '재고 있음' 마커가 보이면 → 재고 있음
-판정하고, 재고 있음일 때만 이메일 알림을 보낸다.
-
-오탐을 줄이기 위해:
-- fetch 실패는 알림 없이 비정상 종료
-- '재고 있음' 마커가 있어도 '재고 없음' 마커가 같이 있으면 보수적으로 '없음' 처리
-- 직전 상태를 state 파일에 저장해 두고, '없음 → 있음' 전이일 때만 알림
+- '없음 → 있음' 전이일 때만 메일 알림
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
-import requests
+from playwright.sync_api import sync_playwright
 
 PRODUCT_URL = (
     "https://www.cartier.com/ko-kr/주얼리/브레이슬릿/다이아몬드-컬렉션/"
@@ -27,11 +25,10 @@ PRODUCT_URL = (
     "CRB6043300.html"
 )
 
-# 한국어 / 영어 페이지 양쪽에서 관찰된 '재고 없음' 신호들.
 OUT_OF_STOCK_MARKERS = [
     "상담원 연결",
     "상담원에게 문의",
-    "현재 온라인에서 구매",  # "현재 온라인에서 구매할 수 없습니다" 등
+    "현재 온라인에서 구매",
     "재입고 알림",
     "Contact an ambassador",
     "Currently unavailable online",
@@ -39,7 +36,6 @@ OUT_OF_STOCK_MARKERS = [
     "back in stock",
 ]
 
-# '재고 있음' 신호 — 하나라도 보이고 위쪽 마커가 없으면 거의 확실히 구매 가능.
 IN_STOCK_MARKERS = [
     "장바구니에 담기",
     "장바구니에 추가",
@@ -50,26 +46,41 @@ IN_STOCK_MARKERS = [
     "Select your size",
 ]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 STATE_PATH = Path(__file__).resolve().parent.parent / "state" / "last_status.json"
 
 
 def fetch_page(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+    """Playwright로 페이지를 열고 최종 HTML을 반환."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="ko-KR",
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers={
+                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            },
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # JS 렌더가 끝날 시간을 좀 줌 (네트워크 idle 까지 기다리지 않는 이유:
+        # 까르띠에 페이지에 backgroud poll 등이 있어서 영원히 안 끝날 수 있음)
+        page.wait_for_timeout(5_000)
+        html = page.content()
+        browser.close()
+        return html
 
 
 def judge(html: str) -> tuple[bool, list[str], list[str]]:
@@ -107,17 +118,18 @@ def main() -> int:
     in_stock, found_in, found_out = judge(html)
     prev = load_prev_status()
 
+    print(f"[INFO] html length = {len(html)}")
     print(f"[INFO] in_stock={in_stock} prev={prev}")
     print(f"[INFO] found_in={found_in}")
     print(f"[INFO] found_out={found_out}")
 
-    # 마커가 하나도 안 잡히면 페이지 구조가 바뀌었거나 봇 차단 가능성 → 조용히 종료
     if not found_in and not found_out:
         print("[WARN] no marker matched. Page layout may have changed or got blocked.")
+        # 디버깅용: HTML 앞부분만 출력해서 어떤 페이지를 받았는지 확인
+        print("[DEBUG] html head:", html[:2000])
         return 2
 
     if in_stock and prev is not True:
-        # '없음 → 있음' 전이일 때만 알림 (또는 첫 실행)
         from notify import send_notification
 
         body_lines = [
@@ -138,7 +150,6 @@ def main() -> int:
             print("[INFO] notification sent")
         except Exception as e:
             print(f"[ERROR] notification failed: {e}", file=sys.stderr)
-            # 알림 실패해도 상태 저장은 하지 않음 → 다음 실행에서 재시도
             return 3
 
     save_status(in_stock)
