@@ -1,0 +1,55 @@
+name: Cartier d'Amour stock check
+
+on:
+  schedule:
+    # 매 11분마다 (UTC). 0,11,22,33,44,55 분.
+    # 참고: GitHub Actions cron은 정시에 정확히 안 돌고 종종 5~10분 늦습니다.
+    - cron: "*/11 * * * *"
+  workflow_dispatch: {} # 수동 실행 가능
+
+permissions:
+  contents: write # state 파일 commit 용
+
+concurrency:
+  group: cartier-stock-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --no-cache-dir requests==2.32.3
+
+      - name: Run stock check
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: "sigkgk100@gmail.com,qufquf_@naver.com"
+        run: python scripts/check_stock.py
+
+      - name: Commit state (if changed)
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/
+            git commit -m "chore: update stock state [skip ci]"
+            git push
+          else
+            echo "no state change"
+          fi
